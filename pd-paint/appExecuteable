@@ -1,0 +1,4 @@
+#!/bin/pdos
+# PD-OS Native ARM32 Application Executable
+# Package: pd-paint v1.2.0 (Amlogic S905L)
+exec gde_paint_open

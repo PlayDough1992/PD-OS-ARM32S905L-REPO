@@ -1,0 +1,10 @@
+[Package]
+name=pd-calc
+display=Calculator
+version=1.0.0
+creator=PlayDough1992
+description=Standard and scientific desktop calculator
+executable=appExecuteable
+arch=arm32-s905l
+icon=calc
+category=Accessories

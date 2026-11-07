@@ -1,0 +1,4 @@
+#!/bin/pdos
+# PD-OS Native ARM32 Application Executable
+# Package: pd-terminal v1.5.0 (Amlogic S905L)
+exec terminal_open

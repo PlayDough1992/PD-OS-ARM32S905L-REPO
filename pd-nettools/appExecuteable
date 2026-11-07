@@ -1,0 +1,4 @@
+#!/bin/pdos
+# PD-OS Native ARM32 Application Executable
+# Package: pd-nettools v1.0.0 (Amlogic S905L)
+exec nettools_open

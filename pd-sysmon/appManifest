@@ -1,0 +1,10 @@
+[Package]
+name=pd-sysmon
+display=System Monitor
+version=2.0.0
+creator=PlayDough1992
+description=Real-time CPU, RAM, and hardware metrics
+executable=appExecuteable
+arch=arm32-s905l
+icon=sysmon
+category=System

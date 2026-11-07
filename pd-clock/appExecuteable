@@ -1,0 +1,4 @@
+#!/bin/pdos
+# PD-OS Native ARM32 Application Executable
+# Package: pd-clock v1.0.1 (Amlogic S905L)
+exec gde_clock_open

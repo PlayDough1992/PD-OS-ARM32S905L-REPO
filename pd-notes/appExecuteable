@@ -1,0 +1,4 @@
+#!/bin/pdos
+# PD-OS Native ARM32 Application Executable
+# Package: pd-notes v1.1.0 (Amlogic S905L)
+exec gde_notes_open
