@@ -1,0 +1,133 @@
+/*
+ * calc.c — Simple calculator for PD-OS
+ *
+ * Build: open in PD-Text, press Build → Compile + Run
+ * Or compile via terminal: tcc /home/pd/Documents/calc.c
+ */
+#include <app.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+#define WIN_W   240
+#define WIN_H   320
+
+#define DISP_X   10
+#define DISP_Y   10
+#define DISP_W  (WIN_W - 20)
+#define DISP_H   48
+
+#define GRID_X   10
+#define GRID_Y   72
+#define BTN_W    50
+#define BTN_H    44
+#define BTN_GAP   4
+
+static char   g_disp[32] = "0";
+static double g_pending   = 0.0;
+static char   g_op        = 0;
+static int    g_reset     = 1;
+
+static const char *BTN[5][4] = {
+    { "C",  "+/-", "%",  "/"  },
+    { "7",  "8",   "9",  "*"  },
+    { "4",  "5",   "6",  "-"  },
+    { "1",  "2",   "3",  "+"  },
+    { "0",  ".",   "=",  "="  },
+};
+
+static void set_disp(double v)
+{
+    snprintf(g_disp, sizeof(g_disp), "%g", v);
+}
+
+static void do_digit(char d)
+{
+    if (g_reset || (g_disp[0] == '0' && g_disp[1] == '\0')) {
+        if (d == '.') { g_disp[0]='0'; g_disp[1]='.'; g_disp[2]='\0'; }
+        else           { g_disp[0]=d;   g_disp[1]='\0'; }
+        g_reset = 0;
+    } else {
+        if (d == '.' && strchr(g_disp, '.')) return;
+        int len = (int)strlen(g_disp);
+        if (len < 15) { g_disp[len] = d; g_disp[len+1] = '\0'; }
+    }
+}
+
+static void do_op(char op)
+{
+    double v = atof(g_disp);
+    if (g_op && !g_reset) {
+        switch (g_op) {
+            case '+': g_pending += v; break;
+            case '-': g_pending -= v; break;
+            case '*': g_pending *= v; break;
+            case '/': if (v != 0.0) g_pending /= v;
+                      else { snprintf(g_disp, sizeof(g_disp), "Error"); g_op=0; g_reset=1; return; }
+                      break;
+        }
+        set_disp(g_pending);
+    } else {
+        g_pending = v;
+    }
+    g_op    = (op == '=') ? 0 : op;
+    g_reset = 1;
+}
+
+static void on_click(app_window_t *win, int mx, int my)
+{
+    for (int r = 0; r < 5; r++) {
+        for (int c = 0; c < 4; c++) {
+            int bx = GRID_X + c * (BTN_W + BTN_GAP);
+            int by = GRID_Y + r * (BTN_H + BTN_GAP);
+            if (mx < bx || mx >= bx + BTN_W || my < by || my >= by + BTN_H) continue;
+            const char *lbl = BTN[r][c];
+            char ch = lbl[0];
+            if (ch >= '0' && ch <= '9') { do_digit(ch); }
+            else if (ch == '.') { do_digit('.'); }
+            else if (ch == 'C') {
+                g_disp[0]='0'; g_disp[1]='\0';
+                g_pending=0.0; g_op=0; g_reset=1;
+            }
+            else if (ch == '+' || ch == '-' || ch == '*' || ch == '/' || ch == '=') {
+                do_op(ch);
+            }
+            return;
+        }
+    }
+    (void)win;
+}
+
+static void on_draw(app_window_t *win)
+{
+    /* Background */
+    app_fill_rect(win, 0, 0, WIN_W, WIN_H, APP_BG);
+
+    /* Display box */
+    app_fill_rect(win, DISP_X, DISP_Y, DISP_W, DISP_H, APP_RGB(25, 25, 30));
+    app_draw_rect(win, DISP_X, DISP_Y, DISP_W, DISP_H, APP_MID_GREY);
+    app_draw_text_right(win, DISP_X + DISP_W - 6, DISP_Y + 16, g_disp, APP_WHITE);
+
+    /* Button grid */
+    for (int r = 0; r < 5; r++) {
+        for (int c = 0; c < 4; c++) {
+            int bx = GRID_X + c * (BTN_W + BTN_GAP);
+            int by = GRID_Y + r * (BTN_H + BTN_GAP);
+            int is_op = (c == 3) || (r == 0 && c > 0);
+            uint32_t bg = is_op ? APP_BTN_OP : APP_BTN;
+            app_fill_rect(win, bx, by, BTN_W, BTN_H, bg);
+            app_draw_rect(win, bx, by, BTN_W, BTN_H, APP_RGB(85, 85, 95));
+            app_draw_text_center(win, bx + BTN_W / 2, by + BTN_H / 2 - 8,
+                                 BTN[r][c], APP_WHITE);
+        }
+    }
+}
+
+void app_main(void)
+{
+    app_window_t *win = app_create("Calculator", WIN_W, WIN_H);
+    if (!win) return;
+    app_set_draw (win, on_draw);
+    app_set_click(win, on_click);
+    app_run(win);
+}
