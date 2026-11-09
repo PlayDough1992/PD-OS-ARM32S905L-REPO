@@ -1,0 +1,141 @@
+/*
+ * paint.pda — Paint Studio for PD-OS
+ *
+ * Build: open in PD-Text, press Build → Compile + Run
+ * Or compile via terminal: tcc /home/pd/Documents/paint.c
+ */
+#include <app.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+#define WIN_W   420
+#define WIN_H   340
+
+#define TOOLBAR_H  36
+#define PAL_X      10
+#define PAL_Y      6
+#define SWATCH_W   20
+#define SWATCH_H   20
+#define SWATCH_GAP  4
+#define NUM_COLORS 10
+
+#define CANVAS_X   10
+#define CANVAS_Y   44
+#define CANVAS_W  (WIN_W - 20)
+#define CANVAS_H  (WIN_H - 54)
+
+static uint32_t g_palette[NUM_COLORS] = {
+    APP_RGB(  0,   0,   0),   /* Black */
+    APP_RGB(255, 255, 255),   /* White */
+    APP_RGB(230,  50,  50),   /* Red */
+    APP_RGB( 50, 200,  80),   /* Green */
+    APP_RGB( 40, 120, 240),   /* Blue */
+    APP_RGB(240, 200,  40),   /* Yellow */
+    APP_RGB( 40, 220, 220),   /* Cyan */
+    APP_RGB(220,  60, 200),   /* Magenta */
+    APP_RGB(240, 130,  40),   /* Orange */
+    APP_RGB(128, 128, 138),   /* Grey */
+};
+
+static uint32_t g_cur_col = APP_RGB(230, 50, 50);
+static int      g_brush_sz = 3;
+static uint32_t g_canvas[CANVAS_W * CANVAS_H];
+
+static void clear_canvas(void)
+{
+    for (int i = 0; i < CANVAS_W * CANVAS_H; i++) {
+        g_canvas[i] = APP_WHITE;
+    }
+}
+
+static void draw_brush_point(int cx, int cy)
+{
+    for (int dy = -g_brush_sz; dy <= g_brush_sz; dy++) {
+        for (int dx = -g_brush_sz; dx <= g_brush_sz; dx++) {
+            if (dx*dx + dy*dy <= g_brush_sz*g_brush_sz) {
+                int px = cx + dx;
+                int py = cy + dy;
+                if (px >= 0 && px < CANVAS_W && py >= 0 && py < CANVAS_H) {
+                    g_canvas[py * CANVAS_W + px] = g_cur_col;
+                }
+            }
+        }
+    }
+}
+
+static void on_click(app_window_t *win, int mx, int my)
+{
+    /* Check color palette clicks */
+    if (my >= PAL_Y && my < PAL_Y + SWATCH_H) {
+        for (int i = 0; i < NUM_COLORS; i++) {
+            int sx = PAL_X + i * (SWATCH_W + SWATCH_GAP);
+            if (mx >= sx && mx < sx + SWATCH_W) {
+                g_cur_col = g_palette[i];
+                return;
+            }
+        }
+        /* Check Clear button */
+        int clr_x = PAL_X + NUM_COLORS * (SWATCH_W + SWATCH_GAP) + 10;
+        if (mx >= clr_x && mx < clr_x + 50) {
+            clear_canvas();
+            return;
+        }
+    }
+
+    /* Check Canvas clicks */
+    if (mx >= CANVAS_X && mx < CANVAS_X + CANVAS_W &&
+        my >= CANVAS_Y && my < CANVAS_Y + CANVAS_H) {
+        int cx = mx - CANVAS_X;
+        int cy = my - CANVAS_Y;
+        draw_brush_point(cx, cy);
+    }
+    (void)win;
+}
+
+static void on_draw(app_window_t *win)
+{
+    /* Background */
+    app_fill_rect(win, 0, 0, WIN_W, WIN_H, APP_BG);
+
+    /* Palette swatches */
+    for (int i = 0; i < NUM_COLORS; i++) {
+        int sx = PAL_X + i * (SWATCH_W + SWATCH_GAP);
+        app_fill_rect(win, sx, PAL_Y, SWATCH_W, SWATCH_H, g_palette[i]);
+        uint32_t border = (g_palette[i] == g_cur_col) ? APP_WHITE : APP_RGB(80, 80, 90);
+        app_draw_rect(win, sx, PAL_Y, SWATCH_W, SWATCH_H, border);
+        if (g_palette[i] == g_cur_col) {
+            app_draw_rect(win, sx - 1, PAL_Y - 1, SWATCH_W + 2, SWATCH_H + 2, APP_WHITE);
+        }
+    }
+
+    /* Clear Button */
+    int clr_x = PAL_X + NUM_COLORS * (SWATCH_W + SWATCH_GAP) + 10;
+    app_fill_rect(win, clr_x, PAL_Y, 50, SWATCH_H, APP_RGB(60, 60, 75));
+    app_draw_rect(win, clr_x, PAL_Y, 50, SWATCH_H, APP_RGB(100, 100, 120));
+    app_draw_text_center(win, clr_x + 25, PAL_Y + 4, "Clear", APP_WHITE);
+
+    /* Canvas Frame */
+    app_fill_rect(win, CANVAS_X, CANVAS_Y, CANVAS_W, CANVAS_H, APP_WHITE);
+    app_draw_rect(win, CANVAS_X - 1, CANVAS_Y - 1, CANVAS_W + 2, CANVAS_H + 2, APP_MID_GREY);
+
+    /* Render Canvas pixels */
+    for (int y = 0; y < CANVAS_H; y++) {
+        for (int x = 0; x < CANVAS_W; x++) {
+            uint32_t p = g_canvas[y * CANVAS_W + x];
+            if (p != APP_WHITE) {
+                app_fill_rect(win, CANVAS_X + x, CANVAS_Y + y, 1, 1, p);
+            }
+        }
+    }
+}
+
+void app_main(void)
+{
+    clear_canvas();
+    app_window_t *win = app_create("Paint Studio", WIN_W, WIN_H);
+    if (!win) return;
+    app_set_draw (win, on_draw);
+    app_set_click(win, on_click);
+    app_run(win);
+}

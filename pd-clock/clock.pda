@@ -1,0 +1,80 @@
+/*
+ * clock.pda — Desktop Clock & Stopwatch for PD-OS
+ *
+ * Build: open in PD-Text, press Build → Compile + Run
+ * Or compile via terminal: tcc /home/pd/Documents/clock.c
+ */
+#include <app.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+#define WIN_W   260
+#define WIN_H   220
+
+static int g_sec = 0;
+static int g_min = 34;
+static int g_hr  = 12;
+
+static int g_sw_running = 0;
+static int g_sw_tenths  = 0;
+
+static void on_click(app_window_t *win, int mx, int my)
+{
+    /* Start / Stop button: x=30..110, y=160..190 */
+    if (mx >= 30 && mx <= 110 && my >= 160 && my <= 190) {
+        g_sw_running = !g_sw_running;
+        return;
+    }
+    /* Reset button: x=140..220, y=160..190 */
+    if (mx >= 140 && mx <= 220 && my >= 160 && my <= 190) {
+        g_sw_running = 0;
+        g_sw_tenths = 0;
+        return;
+    }
+    (void)win;
+}
+
+static void on_draw(app_window_t *win)
+{
+    /* Background */
+    app_fill_rect(win, 0, 0, WIN_W, WIN_H, APP_BG);
+
+    /* Clock Display Box */
+    app_fill_rect(win, 20, 20, WIN_W - 40, 60, APP_RGB(20, 25, 35));
+    app_draw_rect(win, 20, 20, WIN_W - 40, 60, APP_RGB(50, 70, 110));
+
+    char time_str[32];
+    snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d", g_hr, g_min, g_sec);
+    app_draw_text_center(win, WIN_W / 2, 42, time_str, APP_WHITE);
+
+    /* Stopwatch Section */
+    app_fill_rect(win, 20, 95, WIN_W - 40, 50, APP_RGB(25, 30, 40));
+    app_draw_rect(win, 20, 95, WIN_W - 40, 50, APP_RGB(60, 60, 80));
+
+    int sw_m = (g_sw_tenths / 600);
+    int sw_s = (g_sw_tenths / 10) % 60;
+    int sw_t = g_sw_tenths % 10;
+    char sw_str[32];
+    snprintf(sw_str, sizeof(sw_str), "Stopwatch: %02d:%02d.%d", sw_m, sw_s, sw_t);
+    app_draw_text_center(win, WIN_W / 2, 112, sw_str, APP_RGB(100, 200, 255));
+
+    /* Buttons */
+    uint32_t btn1_col = g_sw_running ? APP_RGB(180, 50, 50) : APP_RGB(50, 140, 70);
+    app_fill_rect(win, 30, 160, 80, 30, btn1_col);
+    app_draw_rect(win, 30, 160, 80, 30, APP_WHITE);
+    app_draw_text_center(win, 70, 168, g_sw_running ? "Stop" : "Start", APP_WHITE);
+
+    app_fill_rect(win, 150, 160, 80, 30, APP_RGB(60, 65, 80));
+    app_draw_rect(win, 150, 160, 80, 30, APP_MID_GREY);
+    app_draw_text_center(win, 190, 168, "Reset", APP_WHITE);
+}
+
+void app_main(void)
+{
+    app_window_t *win = app_create("Clock", WIN_W, WIN_H);
+    if (!win) return;
+    app_set_draw (win, on_draw);
+    app_set_click(win, on_click);
+    app_run(win);
+}

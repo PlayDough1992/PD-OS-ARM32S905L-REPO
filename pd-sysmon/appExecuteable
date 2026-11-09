@@ -1,4 +1,0 @@
-#!/bin/pdos
-# PD-OS Native ARM32 Application Executable
-# Package: pd-sysmon v2.0.0 (Amlogic S905L)
-exec gde_sysmon_open
