@@ -21,6 +21,7 @@ Each package directory `/opt/<appName>/` contains:
 - **pd-sysmon**: System & Hardware Resource Monitor (`sysmon.pda`, `sysmon.pdj`)
 - **pd-terminal**: Terminal Shell (`terminal.pda`, `terminal.pdj`)
 - **pd-nettools**: Network Diagnostics (`nettools.pda`, `nettools.pdj`)
+- **pd-pdose**: PDOSE Libretro Multi-System Emulator (`pdose.pda`, `pdose.pdj`)
 
 ## Installation via PD-OS Package Manager
 ```bash
@@ -31,4 +32,5 @@ elev pdpm install pd-notes
 elev pdpm install pd-sysmon
 elev pdpm install pd-terminal
 elev pdpm install pd-nettools
+elev pdpm install pd-pdose
 ```

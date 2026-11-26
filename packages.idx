@@ -5,3 +5,4 @@ pd-notes|1.1.0|PlayDough1992|Notes|Lightweight desktop scratchpad and notes
 pd-sysmon|2.0.0|PlayDough1992|System Monitor|Real-time CPU, RAM, and hardware metrics
 pd-terminal|1.5.0|PlayDough1992|Terminal|Interactive terminal shell interface
 pd-nettools|1.0.0|PlayDough1992|Net Tools|Ping, DNS lookup, and network diagnostics
+pd-pdose|1.0.0|PlayDough1992|PDOSE|Libretro Multi-System Emulator (CHIP-8 & Game Boy)

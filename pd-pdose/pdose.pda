@@ -1,0 +1,1222 @@
+/*
+ * pdose.pda — PDOSE: Libretro Multi-System Emulator for PD-OS (ARM32 S905L)
+ *
+ * Implements the standard Libretro v1 Frontend ABI (video refresh, audio
+ * callbacks, RetroPad input state, environment queries, and save states)
+ * with statically linked freestanding Libretro cores:
+ *   1. CHIP-8 Libretro Core (full 35-opcode interpreter + built-in ROMs)
+ *   2. Game Boy (DMG) Libretro Core (SM83 CPU + 160x144 PPU + test ROM)
+ *
+ * External ROMs can be placed in /home/pd/roms/ (game.ch8 / game.gb).
+ *
+ * Build: open in PD-Text, press Build -> Compile + Run
+ * Or compile via terminal: tcc /opt/pdose/pdose.pda
+ */
+#include <app.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+/* ============================================================================
+ * Standard Libretro API v1 Definitions (libretro.h compatible)
+ * ============================================================================ */
+
+#define RETRO_API_VERSION 1
+
+#define RETRO_DEVICE_NONE         0
+#define RETRO_DEVICE_JOYPAD       1
+
+#define RETRO_DEVICE_ID_JOYPAD_B       0
+#define RETRO_DEVICE_ID_JOYPAD_Y       1
+#define RETRO_DEVICE_ID_JOYPAD_SELECT  2
+#define RETRO_DEVICE_ID_JOYPAD_START   3
+#define RETRO_DEVICE_ID_JOYPAD_UP      4
+#define RETRO_DEVICE_ID_JOYPAD_DOWN    5
+#define RETRO_DEVICE_ID_JOYPAD_LEFT    6
+#define RETRO_DEVICE_ID_JOYPAD_RIGHT   7
+#define RETRO_DEVICE_ID_JOYPAD_A       8
+#define RETRO_DEVICE_ID_JOYPAD_X       9
+#define RETRO_DEVICE_ID_JOYPAD_L      10
+#define RETRO_DEVICE_ID_JOYPAD_R      11
+
+enum retro_pixel_format {
+    RETRO_PIXEL_FORMAT_0RGB1555 = 0,
+    RETRO_PIXEL_FORMAT_XRGB8888 = 1,
+    RETRO_PIXEL_FORMAT_RGB565   = 2
+};
+
+#define RETRO_ENVIRONMENT_SET_PIXEL_FORMAT     10
+#define RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY  9
+#define RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY   31
+
+struct retro_system_info {
+    const char *library_name;
+    const char *library_version;
+    const char *valid_extensions;
+    bool        need_fullpath;
+    bool        block_extract;
+};
+
+struct retro_game_geometry {
+    unsigned base_width;
+    unsigned base_height;
+    unsigned max_width;
+    unsigned max_height;
+    float    aspect_ratio;
+};
+
+struct retro_system_timing {
+    double fps;
+    double sample_rate;
+};
+
+struct retro_system_av_info {
+    struct retro_game_geometry geometry;
+    struct retro_system_timing timing;
+};
+
+struct retro_game_info {
+    const char *path;
+    const void *data;
+    size_t      size;
+    const char *meta;
+};
+
+typedef bool    (*retro_environment_t)(unsigned cmd, void *data);
+typedef void    (*retro_video_refresh_t)(const void *data, unsigned width,
+                                         unsigned height, size_t pitch);
+typedef void    (*retro_audio_sample_t)(int16_t left, int16_t right);
+typedef size_t  (*retro_audio_sample_batch_t)(const int16_t *data, size_t frames);
+typedef void    (*retro_input_poll_t)(void);
+typedef int16_t (*retro_input_state_t)(unsigned port, unsigned device,
+                                       unsigned index, unsigned id);
+
+/* Statically linked Libretro core interface table */
+typedef struct {
+    const char *id;
+    const char *label;
+    const char *default_rom_path;
+    unsigned (*api_version)(void);
+    void     (*init)(void);
+    void     (*deinit)(void);
+    void     (*set_environment)(retro_environment_t cb);
+    void     (*set_video_refresh)(retro_video_refresh_t cb);
+    void     (*set_audio_sample)(retro_audio_sample_t cb);
+    void     (*set_audio_sample_batch)(retro_audio_sample_batch_t cb);
+    void     (*set_input_poll)(retro_input_poll_t cb);
+    void     (*set_input_state)(retro_input_state_t cb);
+    void     (*get_system_info)(struct retro_system_info *info);
+    void     (*get_system_av_info)(struct retro_system_av_info *info);
+    bool     (*load_game)(const struct retro_game_info *game);
+    void     (*unload_game)(void);
+    void     (*run)(void);
+    void     (*reset)(void);
+    size_t   (*serialize_size)(void);
+    bool     (*serialize)(void *data, size_t size);
+    bool     (*unserialize)(const void *data, size_t size);
+} pdose_core_t;
+
+/* ============================================================================
+ * CORE 1: CHIP-8 Libretro Core (Full 35-Opcode Interpreter)
+ * ============================================================================ */
+
+#define C8_W 64
+#define C8_H 32
+
+typedef struct {
+    uint8_t  mem[4096];
+    uint8_t  v[16];
+    uint16_t I;
+    uint16_t pc;
+    uint16_t stack[16];
+    uint8_t  sp;
+    uint8_t  dt;
+    uint8_t  st;
+    uint8_t  fb[C8_W * C8_H];
+    uint32_t rng;
+} chip8_state_t;
+
+static chip8_state_t         g_c8;
+static uint32_t              g_c8_rgba[C8_W * C8_H];
+static uint8_t               g_c8_rom_bak[3584];
+static size_t                g_c8_rom_len = 0;
+static retro_environment_t   g_c8_env_cb  = NULL;
+static retro_video_refresh_t g_c8_vid_cb  = NULL;
+static retro_input_poll_t    g_c8_poll_cb = NULL;
+static retro_input_state_t   g_c8_in_cb   = NULL;
+
+static const uint8_t C8_FONT[80] = {
+    0xF0,0x90,0x90,0x90,0xF0,  0x20,0x60,0x20,0x20,0x70,
+    0xF0,0x10,0xF0,0x80,0xF0,  0xF0,0x10,0xF0,0x10,0xF0,
+    0x90,0x90,0xF0,0x10,0x10,  0xF0,0x80,0xF0,0x10,0xF0,
+    0xF0,0x80,0xF0,0x90,0xF0,  0xF0,0x10,0x20,0x40,0x40,
+    0xF0,0x90,0xF0,0x90,0xF0,  0xF0,0x90,0xF0,0x10,0xF0,
+    0xF0,0x90,0xF0,0x90,0x90,  0xE0,0x90,0xE0,0x90,0xE0,
+    0xF0,0x80,0x80,0x80,0xF0,  0xE0,0x90,0x90,0x90,0xE0,
+    0xF0,0x80,0xF0,0x80,0xF0,  0xF0,0x80,0xF0,0x80,0x80
+};
+
+static uint8_t c8_rand(void)
+{
+    g_c8.rng = g_c8.rng * 1664525u + 1013904223u;
+    return (uint8_t)(g_c8.rng >> 24);
+}
+
+static int c8_key_pressed(uint8_t key)
+{
+    if (!g_c8_in_cb) return 0;
+    unsigned btn = 0xFF;
+    switch (key & 0xF) {
+        case 0x2: btn = RETRO_DEVICE_ID_JOYPAD_UP;     break;
+        case 0x8: btn = RETRO_DEVICE_ID_JOYPAD_DOWN;   break;
+        case 0x4: btn = RETRO_DEVICE_ID_JOYPAD_LEFT;   break;
+        case 0x6: btn = RETRO_DEVICE_ID_JOYPAD_RIGHT;  break;
+        case 0x5: btn = RETRO_DEVICE_ID_JOYPAD_A;      break;
+        case 0x1: btn = RETRO_DEVICE_ID_JOYPAD_B;      break;
+        case 0x3: btn = RETRO_DEVICE_ID_JOYPAD_X;      break;
+        case 0x7: btn = RETRO_DEVICE_ID_JOYPAD_Y;      break;
+        case 0xA: btn = RETRO_DEVICE_ID_JOYPAD_START;  break;
+        case 0xB: btn = RETRO_DEVICE_ID_JOYPAD_SELECT; break;
+        default:  return 0;
+    }
+    return g_c8_in_cb(0, RETRO_DEVICE_JOYPAD, 0, btn) ? 1 : 0;
+}
+
+static void c8_reset_cpu(void)
+{
+    memset(&g_c8, 0, sizeof(g_c8));
+    memcpy(g_c8.mem + 0x050, C8_FONT, sizeof(C8_FONT));
+    if (g_c8_rom_len > 0) {
+        memcpy(g_c8.mem + 0x200, g_c8_rom_bak, g_c8_rom_len);
+    }
+    g_c8.pc  = 0x200;
+    g_c8.rng = 0x13572468u;
+}
+
+static void c8_step(void)
+{
+    uint16_t pc = g_c8.pc & 0x0FFFu;
+    uint16_t op = ((uint16_t)g_c8.mem[pc] << 8) | g_c8.mem[(pc + 1u) & 0x0FFFu];
+    g_c8.pc = (uint16_t)((pc + 2u) & 0x0FFFu);
+
+    uint16_t nnn = op & 0x0FFFu;
+    uint8_t  nn  = (uint8_t)(op & 0x00FFu);
+    uint8_t  n   = (uint8_t)(op & 0x000Fu);
+    uint8_t  x   = (uint8_t)((op >> 8) & 0x0Fu);
+    uint8_t  y   = (uint8_t)((op >> 4) & 0x0Fu);
+
+    switch (op & 0xF000u) {
+        case 0x0000:
+            if (op == 0x00E0) {
+                memset(g_c8.fb, 0, sizeof(g_c8.fb));
+            } else if (op == 0x00EE && g_c8.sp > 0) {
+                g_c8.pc = g_c8.stack[--g_c8.sp];
+            }
+            break;
+        case 0x1000: g_c8.pc = nnn; break;
+        case 0x2000:
+            if (g_c8.sp < 16) g_c8.stack[g_c8.sp++] = g_c8.pc;
+            g_c8.pc = nnn;
+            break;
+        case 0x3000: if (g_c8.v[x] == nn) g_c8.pc += 2; break;
+        case 0x4000: if (g_c8.v[x] != nn) g_c8.pc += 2; break;
+        case 0x5000: if (g_c8.v[x] == g_c8.v[y]) g_c8.pc += 2; break;
+        case 0x6000: g_c8.v[x] = nn; break;
+        case 0x7000: g_c8.v[x] = (uint8_t)(g_c8.v[x] + nn); break;
+        case 0x8000:
+            switch (n) {
+                case 0x0: g_c8.v[x] = g_c8.v[y]; break;
+                case 0x1: g_c8.v[x] |= g_c8.v[y]; break;
+                case 0x2: g_c8.v[x] &= g_c8.v[y]; break;
+                case 0x3: g_c8.v[x] ^= g_c8.v[y]; break;
+                case 0x4: {
+                    uint16_t s = (uint16_t)g_c8.v[x] + g_c8.v[y];
+                    g_c8.v[0xF] = (s > 0xFFu) ? 1u : 0u;
+                    g_c8.v[x] = (uint8_t)s;
+                    break;
+                }
+                case 0x5:
+                    g_c8.v[0xF] = (g_c8.v[x] >= g_c8.v[y]) ? 1u : 0u;
+                    g_c8.v[x] = (uint8_t)(g_c8.v[x] - g_c8.v[y]);
+                    break;
+                case 0x6:
+                    g_c8.v[0xF] = g_c8.v[x] & 1u;
+                    g_c8.v[x] >>= 1;
+                    break;
+                case 0x7:
+                    g_c8.v[0xF] = (g_c8.v[y] >= g_c8.v[x]) ? 1u : 0u;
+                    g_c8.v[x] = (uint8_t)(g_c8.v[y] - g_c8.v[x]);
+                    break;
+                case 0xE:
+                    g_c8.v[0xF] = (g_c8.v[x] >> 7) & 1u;
+                    g_c8.v[x] <<= 1;
+                    break;
+                default: break;
+            }
+            break;
+        case 0x9000: if (g_c8.v[x] != g_c8.v[y]) g_c8.pc += 2; break;
+        case 0xA000: g_c8.I = nnn; break;
+        case 0xB000: g_c8.pc = (uint16_t)((nnn + g_c8.v[0]) & 0x0FFFu); break;
+        case 0xC000: g_c8.v[x] = c8_rand() & nn; break;
+        case 0xD000: {
+            uint8_t vx = g_c8.v[x] % C8_W;
+            uint8_t vy = g_c8.v[y] % C8_H;
+            g_c8.v[0xF] = 0;
+            for (uint8_t row = 0; row < n; row++) {
+                uint8_t spr = g_c8.mem[(g_c8.I + row) & 0x0FFFu];
+                uint8_t py  = (uint8_t)((vy + row) % C8_H);
+                for (uint8_t bit = 0; bit < 8; bit++) {
+                    if (spr & (0x80u >> bit)) {
+                        uint8_t px = (uint8_t)((vx + bit) % C8_W);
+                        uint8_t *cell = &g_c8.fb[py * C8_W + px];
+                        if (*cell) g_c8.v[0xF] = 1;
+                        *cell ^= 1u;
+                    }
+                }
+            }
+            break;
+        }
+        case 0xE000:
+            if (nn == 0x9E && c8_key_pressed(g_c8.v[x])) g_c8.pc += 2;
+            else if (nn == 0xA1 && !c8_key_pressed(g_c8.v[x])) g_c8.pc += 2;
+            break;
+        case 0xF000:
+            switch (nn) {
+                case 0x07: g_c8.v[x] = g_c8.dt; break;
+                case 0x0A: {
+                    int got = -1;
+                    for (uint8_t k = 0; k < 16; k++) {
+                        if (c8_key_pressed(k)) { got = k; break; }
+                    }
+                    if (got >= 0) g_c8.v[x] = (uint8_t)got;
+                    else g_c8.pc -= 2;
+                    break;
+                }
+                case 0x15: g_c8.dt = g_c8.v[x]; break;
+                case 0x18: g_c8.st = g_c8.v[x]; break;
+                case 0x1E: g_c8.I = (uint16_t)((g_c8.I + g_c8.v[x]) & 0x0FFFu); break;
+                case 0x29: g_c8.I = (uint16_t)(0x050u + (g_c8.v[x] & 0x0Fu) * 5u); break;
+                case 0x33:
+                    g_c8.mem[(g_c8.I)     & 0x0FFFu] = g_c8.v[x] / 100u;
+                    g_c8.mem[(g_c8.I + 1) & 0x0FFFu] = (g_c8.v[x] / 10u) % 10u;
+                    g_c8.mem[(g_c8.I + 2) & 0x0FFFu] = g_c8.v[x] % 10u;
+                    break;
+                case 0x55:
+                    for (uint8_t i = 0; i <= x; i++)
+                        g_c8.mem[(g_c8.I + i) & 0x0FFFu] = g_c8.v[i];
+                    break;
+                case 0x65:
+                    for (uint8_t i = 0; i <= x; i++)
+                        g_c8.v[i] = g_c8.mem[(g_c8.I + i) & 0x0FFFu];
+                    break;
+                default: break;
+            }
+            break;
+        default: break;
+    }
+}
+
+static unsigned c8_api_version(void) { return RETRO_API_VERSION; }
+static void c8_init(void) { c8_reset_cpu(); }
+static void c8_deinit(void) { g_c8_rom_len = 0; }
+static void c8_set_env(retro_environment_t cb) { g_c8_env_cb = cb; }
+static void c8_set_vid(retro_video_refresh_t cb) { g_c8_vid_cb = cb; }
+static void c8_set_aud(retro_audio_sample_t cb) { (void)cb; }
+static void c8_set_aud_batch(retro_audio_sample_batch_t cb) { (void)cb; }
+static void c8_set_poll(retro_input_poll_t cb) { g_c8_poll_cb = cb; }
+static void c8_set_in(retro_input_state_t cb) { g_c8_in_cb = cb; }
+
+static void c8_get_sys_info(struct retro_system_info *info)
+{
+    info->library_name     = "PDOSE-CHIP8";
+    info->library_version  = "1.0.0";
+    info->valid_extensions = "ch8|c8|rom";
+    info->need_fullpath    = false;
+    info->block_extract    = false;
+}
+
+static void c8_get_av_info(struct retro_system_av_info *info)
+{
+    info->geometry.base_width   = C8_W;
+    info->geometry.base_height  = C8_H;
+    info->geometry.max_width    = C8_W;
+    info->geometry.max_height   = C8_H;
+    info->geometry.aspect_ratio = 2.0f;
+    info->timing.fps            = 60.0;
+    info->timing.sample_rate    = 44100.0;
+}
+
+static bool c8_load_game(const struct retro_game_info *game)
+{
+    if (!game || !game->data || game->size == 0 || game->size > sizeof(g_c8_rom_bak))
+        return false;
+    enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
+    if (g_c8_env_cb) g_c8_env_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt);
+    memcpy(g_c8_rom_bak, game->data, game->size);
+    g_c8_rom_len = game->size;
+    c8_reset_cpu();
+    return true;
+}
+
+static void c8_unload_game(void) { g_c8_rom_len = 0; c8_reset_cpu(); }
+static void c8_reset(void) { c8_reset_cpu(); }
+
+static void c8_run(void)
+{
+    if (g_c8_poll_cb) g_c8_poll_cb();
+    for (int i = 0; i < 10; i++) c8_step();
+    if (g_c8.dt > 0) g_c8.dt--;
+    if (g_c8.st > 0) g_c8.st--;
+
+    for (int i = 0; i < C8_W * C8_H; i++) {
+        g_c8_rgba[i] = g_c8.fb[i] ? APP_RGB(130, 255, 165) : APP_RGB(12, 22, 18);
+    }
+    if (g_c8_vid_cb) {
+        g_c8_vid_cb(g_c8_rgba, C8_W, C8_H, C8_W * sizeof(uint32_t));
+    }
+}
+
+static size_t c8_ser_size(void) { return sizeof(chip8_state_t); }
+static bool c8_ser(void *data, size_t size)
+{
+    if (!data || size < sizeof(chip8_state_t)) return false;
+    memcpy(data, &g_c8, sizeof(chip8_state_t));
+    return true;
+}
+static bool c8_unser(const void *data, size_t size)
+{
+    if (!data || size < sizeof(chip8_state_t)) return false;
+    memcpy(&g_c8, data, sizeof(chip8_state_t));
+    return true;
+}
+
+/* ============================================================================
+ * CORE 2: Game Boy (DMG) Libretro Core (SM83 CPU + 160x144 PPU)
+ * ============================================================================ */
+
+#define GB_W 160
+#define GB_H 144
+
+typedef struct {
+    uint8_t  vram[0x2000];
+    uint8_t  wram[0x2000];
+    uint8_t  oam[0xA0];
+    uint8_t  hram[0x7F];
+    uint8_t  io[0x80];
+    uint8_t  ie;
+    uint8_t  a, f, b, c, d, e, h, l;
+    uint16_t sp, pc;
+    uint8_t  ime, halted;
+    uint32_t cycles;
+    uint8_t  ly;
+    uint32_t line_cyc;
+    uint8_t  mbc_bank;
+} gb_state_t;
+
+static gb_state_t            g_gb;
+static uint8_t              *g_gb_rom     = NULL;
+static size_t                g_gb_rom_sz  = 0;
+static uint32_t              g_gb_rgba[GB_W * GB_H];
+static retro_environment_t   g_gb_env_cb  = NULL;
+static retro_video_refresh_t g_gb_vid_cb  = NULL;
+static retro_input_poll_t    g_gb_poll_cb = NULL;
+static retro_input_state_t   g_gb_in_cb   = NULL;
+
+static const uint32_t GB_PAL[4] = {
+    APP_RGB(224, 248, 208),
+    APP_RGB(136, 192, 112),
+    APP_RGB( 52, 104,  86),
+    APP_RGB(  8,  24,  32)
+};
+
+static uint8_t gb_joyp_read(void)
+{
+    uint8_t sel = g_gb.io[0x00] & 0x30u;
+    uint8_t low = 0x0Fu;
+    if (g_gb_in_cb) {
+        if (!(sel & 0x10u)) {
+            if (g_gb_in_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT)) low &= ~0x01u;
+            if (g_gb_in_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT))  low &= ~0x02u;
+            if (g_gb_in_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP))    low &= ~0x04u;
+            if (g_gb_in_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN))  low &= ~0x08u;
+        }
+        if (!(sel & 0x20u)) {
+            if (g_gb_in_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A))      low &= ~0x01u;
+            if (g_gb_in_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B))      low &= ~0x02u;
+            if (g_gb_in_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_SELECT)) low &= ~0x04u;
+            if (g_gb_in_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START))  low &= ~0x08u;
+        }
+    }
+    return (uint8_t)(0xC0u | sel | low);
+}
+
+static uint8_t gb_rb(uint16_t addr)
+{
+    if (addr < 0x4000u) {
+        return (g_gb_rom && addr < g_gb_rom_sz) ? g_gb_rom[addr] : 0xFFu;
+    }
+    if (addr < 0x8000u) {
+        size_t off = (size_t)g_gb.mbc_bank * 0x4000u + (addr - 0x4000u);
+        return (g_gb_rom && off < g_gb_rom_sz) ? g_gb_rom[off] : 0xFFu;
+    }
+    if (addr < 0xA000u) return g_gb.vram[addr - 0x8000u];
+    if (addr >= 0xC000u && addr < 0xE000u) return g_gb.wram[addr - 0xC000u];
+    if (addr >= 0xE000u && addr < 0xFE00u) return g_gb.wram[addr - 0xE000u];
+    if (addr >= 0xFE00u && addr < 0xFEA0u) return g_gb.oam[addr - 0xFE00u];
+    if (addr >= 0xFF00u && addr < 0xFF80u) {
+        if (addr == 0xFF00u) return gb_joyp_read();
+        if (addr == 0xFF44u) return g_gb.ly;
+        return g_gb.io[addr - 0xFF00u];
+    }
+    if (addr >= 0xFF80u && addr < 0xFFFFu) return g_gb.hram[addr - 0xFF80u];
+    if (addr == 0xFFFFu) return g_gb.ie;
+    return 0xFFu;
+}
+
+static void gb_wb(uint16_t addr, uint8_t val)
+{
+    if (addr >= 0x2000u && addr < 0x4000u) {
+        g_gb.mbc_bank = (val & 0x1Fu) ? (val & 0x1Fu) : 1u;
+        return;
+    }
+    if (addr >= 0x8000u && addr < 0xA000u) { g_gb.vram[addr - 0x8000u] = val; return; }
+    if (addr >= 0xC000u && addr < 0xE000u) { g_gb.wram[addr - 0xC000u] = val; return; }
+    if (addr >= 0xE000u && addr < 0xFE00u) { g_gb.wram[addr - 0xE000u] = val; return; }
+    if (addr >= 0xFE00u && addr < 0xFEA0u) { g_gb.oam[addr - 0xFE00u] = val; return; }
+    if (addr >= 0xFF00u && addr < 0xFF80u) {
+        if (addr == 0xFF46u) {
+            uint16_t src = (uint16_t)val << 8;
+            for (int i = 0; i < 0xA0; i++) g_gb.oam[i] = gb_rb((uint16_t)(src + i));
+        }
+        g_gb.io[addr - 0xFF00u] = val;
+        return;
+    }
+    if (addr >= 0xFF80u && addr < 0xFFFFu) { g_gb.hram[addr - 0xFF80u] = val; return; }
+    if (addr == 0xFFFFu) g_gb.ie = val;
+}
+
+static uint16_t gb_rw(uint16_t addr)
+{
+    return (uint16_t)gb_rb(addr) | ((uint16_t)gb_rb((uint16_t)(addr + 1u)) << 8);
+}
+
+static void gb_push(uint16_t v)
+{
+    g_gb.sp -= 2;
+    gb_wb(g_gb.sp, (uint8_t)(v & 0xFFu));
+    gb_wb((uint16_t)(g_gb.sp + 1u), (uint8_t)(v >> 8));
+}
+
+static uint16_t gb_pop(void)
+{
+    uint16_t v = gb_rw(g_gb.sp);
+    g_gb.sp += 2;
+    return v;
+}
+
+static void gb_render_scanline(uint8_t ly)
+{
+    if (ly >= GB_H) return;
+    uint8_t lcdc = g_gb.io[0x40];
+    uint8_t scy  = g_gb.io[0x42];
+    uint8_t scx  = g_gb.io[0x43];
+    uint8_t bgp  = g_gb.io[0x47];
+
+    if (!(lcdc & 0x80u)) {
+        for (int x = 0; x < GB_W; x++) g_gb_rgba[ly * GB_W + x] = GB_PAL[0];
+        return;
+    }
+
+    uint16_t map_base  = (lcdc & 0x08u) ? 0x1C00u : 0x1800u;
+    int      unsigned_t = (lcdc & 0x10u) ? 1 : 0;
+    uint8_t  y = (uint8_t)(ly + scy);
+    uint16_t tile_row = (uint16_t)(y >> 3) * 32u;
+
+    for (int x = 0; x < GB_W; x++) {
+        uint8_t px = (uint8_t)(x + scx);
+        uint8_t tid = g_gb.vram[map_base + tile_row + (px >> 3)];
+        uint16_t taddr = unsigned_t
+            ? (uint16_t)tid * 16u
+            : (uint16_t)(0x1000 + ((int8_t)tid) * 16);
+        uint8_t lo = g_gb.vram[(taddr + (y & 7u) * 2u) & 0x1FFFu];
+        uint8_t hi = g_gb.vram[(taddr + (y & 7u) * 2u + 1u) & 0x1FFFu];
+        uint8_t bit = (uint8_t)(7u - (px & 7u));
+        uint8_t cid = (uint8_t)(((lo >> bit) & 1u) | (((hi >> bit) & 1u) << 1));
+        uint8_t shade = (uint8_t)((bgp >> (cid * 2u)) & 3u);
+        g_gb_rgba[ly * GB_W + x] = GB_PAL[shade];
+    }
+
+    if (lcdc & 0x02u) {
+        uint8_t obp0 = g_gb.io[0x48];
+        for (int i = 0; i < 40; i++) {
+            int sy = (int)g_gb.oam[i * 4 + 0] - 16;
+            int sx = (int)g_gb.oam[i * 4 + 1] - 8;
+            uint8_t tile = g_gb.oam[i * 4 + 2];
+            if (ly < sy || ly >= sy + 8) continue;
+            uint8_t row = (uint8_t)(ly - sy);
+            uint8_t lo = g_gb.vram[(tile * 16u + row * 2u) & 0x1FFFu];
+            uint8_t hi = g_gb.vram[(tile * 16u + row * 2u + 1u) & 0x1FFFu];
+            for (int bx = 0; bx < 8; bx++) {
+                int dx = sx + bx;
+                if (dx < 0 || dx >= GB_W) continue;
+                uint8_t bit = (uint8_t)(7 - bx);
+                uint8_t cid = (uint8_t)(((lo >> bit) & 1u) | (((hi >> bit) & 1u) << 1));
+                if (cid != 0) {
+                    uint8_t shade = (uint8_t)((obp0 >> (cid * 2u)) & 3u);
+                    g_gb_rgba[ly * GB_W + dx] = GB_PAL[shade];
+                }
+            }
+        }
+    }
+}
+
+static uint32_t gb_step_cpu(void)
+{
+    if (g_gb.halted) return 4;
+    uint8_t op = gb_rb(g_gb.pc++);
+    uint16_t hl = ((uint16_t)g_gb.h << 8) | g_gb.l;
+    switch (op) {
+        case 0x00: return 4; /* NOP */
+        case 0x06: g_gb.b = gb_rb(g_gb.pc++); return 8;
+        case 0x0E: g_gb.c = gb_rb(g_gb.pc++); return 8;
+        case 0x16: g_gb.d = gb_rb(g_gb.pc++); return 8;
+        case 0x1E: g_gb.e = gb_rb(g_gb.pc++); return 8;
+        case 0x26: g_gb.h = gb_rb(g_gb.pc++); return 8;
+        case 0x2E: g_gb.l = gb_rb(g_gb.pc++); return 8;
+        case 0x3E: g_gb.a = gb_rb(g_gb.pc++); return 8;
+        case 0x21: g_gb.l = gb_rb(g_gb.pc++); g_gb.h = gb_rb(g_gb.pc++); return 12;
+        case 0x31: g_gb.sp = gb_rw(g_gb.pc); g_gb.pc += 2; return 12;
+        case 0x04: g_gb.b++; g_gb.f = (g_gb.b == 0) ? 0x80u : 0u; return 4;
+        case 0x05: g_gb.b--; g_gb.f = (g_gb.b == 0) ? 0xC0u : 0x40u; return 4;
+        case 0x0C: g_gb.c++; g_gb.f = (g_gb.c == 0) ? 0x80u : 0u; return 4;
+        case 0x0D: g_gb.c--; g_gb.f = (g_gb.c == 0) ? 0xC0u : 0x40u; return 4;
+        case 0x3C: g_gb.a++; g_gb.f = (g_gb.a == 0) ? 0x80u : 0u; return 4;
+        case 0x3D: g_gb.a--; g_gb.f = (g_gb.a == 0) ? 0xC0u : 0x40u; return 4;
+        case 0x22: gb_wb(hl, g_gb.a); hl++; g_gb.h = (uint8_t)(hl >> 8); g_gb.l = (uint8_t)hl; return 8;
+        case 0x2A: g_gb.a = gb_rb(hl); hl++; g_gb.h = (uint8_t)(hl >> 8); g_gb.l = (uint8_t)hl; return 8;
+        case 0x77: gb_wb(hl, g_gb.a); return 8;
+        case 0x78: g_gb.a = g_gb.b; return 4;
+        case 0x79: g_gb.a = g_gb.c; return 4;
+        case 0x47: g_gb.b = g_gb.a; return 4;
+        case 0x4F: g_gb.c = g_gb.a; return 4;
+        case 0xAF: g_gb.a = 0; g_gb.f = 0x80u; return 4;
+        case 0xE0: gb_wb((uint16_t)(0xFF00u + gb_rb(g_gb.pc++)), g_gb.a); return 12;
+        case 0xF0: g_gb.a = gb_rb((uint16_t)(0xFF00u + gb_rb(g_gb.pc++))); return 12;
+        case 0xEA: { uint16_t a = gb_rw(g_gb.pc); g_gb.pc += 2; gb_wb(a, g_gb.a); return 16; }
+        case 0xFA: { uint16_t a = gb_rw(g_gb.pc); g_gb.pc += 2; g_gb.a = gb_rb(a); return 16; }
+        case 0x18: { int8_t r = (int8_t)gb_rb(g_gb.pc++); g_gb.pc = (uint16_t)(g_gb.pc + r); return 12; }
+        case 0x20: { int8_t r = (int8_t)gb_rb(g_gb.pc++); if (!(g_gb.f & 0x80u)) { g_gb.pc = (uint16_t)(g_gb.pc + r); return 12; } return 8; }
+        case 0x28: { int8_t r = (int8_t)gb_rb(g_gb.pc++); if (g_gb.f & 0x80u) { g_gb.pc = (uint16_t)(g_gb.pc + r); return 12; } return 8; }
+        case 0xC3: g_gb.pc = gb_rw(g_gb.pc); return 16;
+        case 0xCD: { uint16_t a = gb_rw(g_gb.pc); g_gb.pc += 2; gb_push(g_gb.pc); g_gb.pc = a; return 24; }
+        case 0xC9: g_gb.pc = gb_pop(); return 16;
+        case 0xF3: g_gb.ime = 0; return 4;
+        case 0xFB: g_gb.ime = 1; return 4;
+        case 0x76: g_gb.halted = 1; return 4;
+        case 0xFE: { uint8_t v = gb_rb(g_gb.pc++); g_gb.f = ((g_gb.a == v) ? 0xC0u : 0x40u) | ((g_gb.a < v) ? 0x10u : 0u); return 8; }
+        default:   return 4;
+    }
+}
+
+static void gb_reset_hw(void)
+{
+    memset(&g_gb, 0, sizeof(g_gb));
+    g_gb.pc = 0x0100u;
+    g_gb.sp = 0xFFFEu;
+    g_gb.a  = 0x01u;
+    g_gb.f  = 0xB0u;
+    g_gb.mbc_bank = 1;
+    g_gb.io[0x40] = 0x91u; /* LCDC on, BG on */
+    g_gb.io[0x47] = 0xE4u; /* BGP 3-2-1-0 */
+    g_gb.io[0x48] = 0xE4u; /* OBP0 */
+}
+
+static unsigned gb_api_version(void) { return RETRO_API_VERSION; }
+static void gb_init(void) { gb_reset_hw(); }
+static void gb_deinit(void)
+{
+    if (g_gb_rom) { free(g_gb_rom); g_gb_rom = NULL; }
+    g_gb_rom_sz = 0;
+}
+static void gb_set_env(retro_environment_t cb) { g_gb_env_cb = cb; }
+static void gb_set_vid(retro_video_refresh_t cb) { g_gb_vid_cb = cb; }
+static void gb_set_aud(retro_audio_sample_t cb) { (void)cb; }
+static void gb_set_aud_batch(retro_audio_sample_batch_t cb) { (void)cb; }
+static void gb_set_poll(retro_input_poll_t cb) { g_gb_poll_cb = cb; }
+static void gb_set_in(retro_input_state_t cb) { g_gb_in_cb = cb; }
+
+static void gb_get_sys_info(struct retro_system_info *info)
+{
+    info->library_name     = "PDOSE-GameBoy";
+    info->library_version  = "1.0.0";
+    info->valid_extensions = "gb|gbc";
+    info->need_fullpath    = false;
+    info->block_extract    = false;
+}
+
+static void gb_get_av_info(struct retro_system_av_info *info)
+{
+    info->geometry.base_width   = GB_W;
+    info->geometry.base_height  = GB_H;
+    info->geometry.max_width    = GB_W;
+    info->geometry.max_height   = GB_H;
+    info->geometry.aspect_ratio = (float)GB_W / (float)GB_H;
+    info->timing.fps            = 59.7275;
+    info->timing.sample_rate    = 44100.0;
+}
+
+static bool gb_load_game(const struct retro_game_info *game)
+{
+    if (!game || !game->data || game->size < 0x150) return false;
+    enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
+    if (g_gb_env_cb) g_gb_env_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt);
+    if (g_gb_rom) free(g_gb_rom);
+    g_gb_rom = (uint8_t *)malloc(game->size);
+    if (!g_gb_rom) return false;
+    memcpy(g_gb_rom, game->data, game->size);
+    g_gb_rom_sz = game->size;
+    gb_reset_hw();
+    return true;
+}
+
+static void gb_unload_game(void) { gb_deinit(); gb_reset_hw(); }
+static void gb_reset(void) { gb_reset_hw(); }
+
+static void gb_run(void)
+{
+    if (g_gb_poll_cb) g_gb_poll_cb();
+    uint32_t frame_cyc = 0;
+    while (frame_cyc < 70224u) {
+        uint32_t c = gb_step_cpu();
+        frame_cyc += c;
+        g_gb.line_cyc += c;
+        if (g_gb.line_cyc >= 456u) {
+            g_gb.line_cyc -= 456u;
+            if (g_gb.ly < GB_H) gb_render_scanline(g_gb.ly);
+            g_gb.ly++;
+            if (g_gb.ly == 144u) {
+                g_gb.io[0x0F] |= 0x01u;
+                g_gb.halted = 0;
+            } else if (g_gb.ly >= 154u) {
+                g_gb.ly = 0;
+            }
+        }
+    }
+    if (g_gb_vid_cb) {
+        g_gb_vid_cb(g_gb_rgba, GB_W, GB_H, GB_W * sizeof(uint32_t));
+    }
+}
+
+static size_t gb_ser_size(void) { return sizeof(gb_state_t); }
+static bool gb_ser(void *data, size_t size)
+{
+    if (!data || size < sizeof(gb_state_t)) return false;
+    memcpy(data, &g_gb, sizeof(gb_state_t));
+    return true;
+}
+static bool gb_unser(const void *data, size_t size)
+{
+    if (!data || size < sizeof(gb_state_t)) return false;
+    memcpy(&g_gb, data, sizeof(gb_state_t));
+    return true;
+}
+
+/* ============================================================================
+ * Built-in Playable Test ROMs (CHIP-8 Bounce + Game Boy DMG Scroll Test)
+ * ============================================================================ */
+
+/* CHIP-8 Demo ROM: Draws "PDOSE" sprite & bounces a pixel block across 64x32 */
+static const uint8_t ROM_C8_BOUNCE[] = {
+    0x00, 0xE0, /* 0x200: CLS */
+    0x60, 0x10, /* 0x202: V0 = 16 (x) */
+    0x61, 0x08, /* 0x204: V1 = 8  (y) */
+    0x62, 0x01, /* 0x206: V2 = 1  (dx) */
+    0x63, 0x01, /* 0x208: V3 = 1  (dy) */
+    0xA2, 0x36, /* 0x20A: I = 0x236 (ball sprite) */
+    0xD0, 0x14, /* 0x20C: DRW V0, V1, 4 (initial draw) */
+    /* Loop at 0x20E: */
+    0xD0, 0x14, /* 0x20E: DRW V0, V1, 4 (erase old) */
+    0x80, 0x24, /* 0x210: V0 += V2 */
+    0x81, 0x34, /* 0x212: V1 += V3 */
+    0x30, 0x3B, /* 0x214: SNE V0, 59 */
+    0x62, 0xFF, /* 0x216: V2 = -1 */
+    0x30, 0x01, /* 0x218: SNE V0, 1 */
+    0x62, 0x01, /* 0x21A: V2 = 1 */
+    0x31, 0x1B, /* 0x21C: SNE V1, 27 */
+    0x63, 0xFF, /* 0x21E: V3 = -1 */
+    0x31, 0x01, /* 0x220: SNE V1, 1 */
+    0x63, 0x01, /* 0x222: V3 = 1 */
+    0x64, 0x02, /* 0x224: V4 = key UP (2) */
+    0xE4, 0x9E, /* 0x226: SKP V4 */
+    0x12, 0x2C, /* 0x228: JP 0x22C */
+    0x63, 0xFF, /* 0x22A: V3 = -1 (steer up) */
+    0x64, 0x08, /* 0x22C: V4 = key DOWN (8) */
+    0xE4, 0x9E, /* 0x22E: SKP V4 */
+    0x12, 0x34, /* 0x230: JP 0x234 */
+    0x63, 0x01, /* 0x232: V3 = 1 (steer down) */
+    0xD0, 0x14, /* 0x234: DRW V0, V1, 4 -> wait: sprite at 0x238 */
+    0x12, 0x0E, /* 0x236: JP 0x20E */
+    0xF0, 0x90, 0x90, 0xF0 /* 0x238: 4x4 hollow box sprite */
+};
+
+/* Build a minimal valid 512-byte DMG ROM in memory that populates VRAM tiles
+ * and scrolls SCX/SCY every frame so the Game Boy core renders live graphics. */
+static uint8_t g_gb_demo_rom[512];
+static void build_gb_demo_rom(void)
+{
+    memset(g_gb_demo_rom, 0, sizeof(g_gb_demo_rom));
+    /* Entry point at 0x0100: JP 0x0150 */
+    g_gb_demo_rom[0x100] = 0x00;
+    g_gb_demo_rom[0x101] = 0xC3;
+    g_gb_demo_rom[0x102] = 0x50;
+    g_gb_demo_rom[0x103] = 0x01;
+    memcpy(g_gb_demo_rom + 0x134, "PDOSE DMG TEST", 14);
+
+    /* Program at 0x0150:
+     * Write checkerboard tile #1 at VRAM 0x8010..0x801F, fill BG map 0x9800
+     * with alternating tiles 0 and 1, then loop incrementing SCX (0xFF43). */
+    static const uint8_t prog[] = {
+        0xF3,                   /* DI */
+        0x21, 0x10, 0x80,       /* LD HL, 0x8010 */
+        0x06, 0x08,             /* LD B, 8 */
+        /* tile_loop (0x156): */
+        0x3E, 0xAA, 0x22,       /* LD A, 0xAA; LD (HL+), A */
+        0x3E, 0x55, 0x22,       /* LD A, 0x55; LD (HL+), A */
+        0x05, 0x20, 0xF7,       /* DEC B; JR NZ, tile_loop */
+        /* Fill first 128 BG tiles at 0x9800..0x987F */
+        0x21, 0x00, 0x98,       /* LD HL, 0x9800 */
+        0x06, 0x80,             /* LD B, 128 */
+        /* map_loop: */
+        0x3E, 0x01, 0x22,       /* LD A, 1; LD (HL+), A */
+        0xAF,       0x22,       /* XOR A;   LD (HL+), A */
+        0x05, 0x20, 0xF8,       /* DEC B; JR NZ, map_loop */
+        /* Main loop: wait VBlank (LY == 144), then increment SCX */
+        /* main_loop (0x16B): */
+        0xF0, 0x44,             /* LDH A, (0x44) ; LY */
+        0xFE, 0x90,             /* CP 144 */
+        0x20, 0xFA,             /* JR NZ, main_loop */
+        0xF0, 0x43,             /* LDH A, (0x43) ; SCX */
+        0x3C,                   /* INC A */
+        0xE0, 0x43,             /* LDH (0x43), A */
+        0x18, 0xF3              /* JR main_loop */
+    };
+    memcpy(g_gb_demo_rom + 0x150, prog, sizeof(prog));
+}
+
+/* ============================================================================
+ * PDOSE Frontend State & Libretro Callbacks
+ * ============================================================================ */
+
+#define WIN_W       560
+#define WIN_H       420
+#define VIEW_X       12
+#define VIEW_Y       42
+#define VIEW_W      384
+#define VIEW_H      256
+#define SIDE_X      408
+#define SIDE_W      140
+
+#define MAX_FB_W    256
+#define MAX_FB_H    240
+
+static const pdose_core_t g_cores[2] = {
+    {
+        "chip8", "CHIP-8 Core", "/home/pd/roms/game.ch8",
+        c8_api_version, c8_init, c8_deinit,
+        c8_set_env, c8_set_vid, c8_set_aud, c8_set_aud_batch,
+        c8_set_poll, c8_set_in, c8_get_sys_info, c8_get_av_info,
+        c8_load_game, c8_unload_game, c8_run, c8_reset,
+        c8_ser_size, c8_ser, c8_unser
+    },
+    {
+        "gb", "Game Boy Core", "/home/pd/roms/game.gb",
+        gb_api_version, gb_init, gb_deinit,
+        gb_set_env, gb_set_vid, gb_set_aud, gb_set_aud_batch,
+        gb_set_poll, gb_set_in, gb_get_sys_info, gb_get_av_info,
+        gb_load_game, gb_unload_game, gb_run, gb_reset,
+        gb_ser_size, gb_ser, gb_unser
+    }
+};
+
+static int                     g_core_idx   = 0;
+static int                     g_running    = 1;
+static int                     g_rom_loaded = 0;
+static uint32_t                g_frames     = 0;
+static enum retro_pixel_format g_pix_fmt    = RETRO_PIXEL_FORMAT_XRGB8888;
+static uint32_t                g_fb[MAX_FB_W * MAX_FB_H];
+static unsigned                g_fb_w       = 0;
+static unsigned                g_fb_h       = 0;
+static uint16_t                g_pad_mask   = 0;
+static void                   *g_savestate  = NULL;
+static size_t                  g_savestate_sz = 0;
+static char                    g_status[80] = "PDOSE ready — Libretro ABI v1";
+static char                    g_rom_name[40] = "Built-in Bounce";
+
+static bool fe_env_cb(unsigned cmd, void *data)
+{
+    switch (cmd) {
+        case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT:
+            if (data) {
+                g_pix_fmt = *(const enum retro_pixel_format *)data;
+                return true;
+            }
+            return false;
+        case RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY:
+            if (data) { *(const char **)data = "/home/pd/roms"; return true; }
+            return false;
+        case RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY:
+            if (data) { *(const char **)data = "/home/pd/saves"; return true; }
+            return false;
+        default:
+            return false;
+    }
+}
+
+static uint32_t conv_rgb565(uint16_t p)
+{
+    uint8_t r = (uint8_t)(((p >> 11) & 0x1Fu) << 3);
+    uint8_t g = (uint8_t)(((p >>  5) & 0x3Fu) << 2);
+    uint8_t b = (uint8_t)(( p        & 0x1Fu) << 3);
+    return APP_RGB(r, g, b);
+}
+
+static uint32_t conv_0rgb1555(uint16_t p)
+{
+    uint8_t r = (uint8_t)(((p >> 10) & 0x1Fu) << 3);
+    uint8_t g = (uint8_t)(((p >>  5) & 0x1Fu) << 3);
+    uint8_t b = (uint8_t)(( p        & 0x1Fu) << 3);
+    return APP_RGB(r, g, b);
+}
+
+static void fe_video_cb(const void *data, unsigned width, unsigned height, size_t pitch)
+{
+    if (!data || width == 0 || height == 0) return;
+    if (width > MAX_FB_W) width = MAX_FB_W;
+    if (height > MAX_FB_H) height = MAX_FB_H;
+    g_fb_w = width;
+    g_fb_h = height;
+
+    const uint8_t *src = (const uint8_t *)data;
+    for (unsigned y = 0; y < height; y++) {
+        const uint8_t *row = src + y * pitch;
+        uint32_t *dst = g_fb + y * width;
+        if (g_pix_fmt == RETRO_PIXEL_FORMAT_XRGB8888) {
+            memcpy(dst, row, width * sizeof(uint32_t));
+        } else if (g_pix_fmt == RETRO_PIXEL_FORMAT_RGB565) {
+            const uint16_t *r16 = (const uint16_t *)row;
+            for (unsigned x = 0; x < width; x++) dst[x] = conv_rgb565(r16[x]);
+        } else {
+            const uint16_t *r16 = (const uint16_t *)row;
+            for (unsigned x = 0; x < width; x++) dst[x] = conv_0rgb1555(r16[x]);
+        }
+    }
+}
+
+static void fe_audio_cb(int16_t l, int16_t r) { (void)l; (void)r; }
+static size_t fe_audio_batch_cb(const int16_t *d, size_t f) { (void)d; return f; }
+static void fe_input_poll_cb(void) { /* Input state updated via UI / pad mask */ }
+
+static int16_t fe_input_state_cb(unsigned port, unsigned device,
+                                 unsigned index, unsigned id)
+{
+    if (port != 0 || device != RETRO_DEVICE_JOYPAD || index != 0 || id >= 16)
+        return 0;
+    return (g_pad_mask & (1u << id)) ? 1 : 0;
+}
+
+static void pdose_select_core(int idx)
+{
+    if (idx < 0 || idx >= 2) return;
+    if (g_rom_loaded) {
+        g_cores[g_core_idx].unload_game();
+        g_cores[g_core_idx].deinit();
+        g_rom_loaded = 0;
+    }
+    if (g_savestate) { free(g_savestate); g_savestate = NULL; g_savestate_sz = 0; }
+
+    g_core_idx = idx;
+    const pdose_core_t *c = &g_cores[g_core_idx];
+    c->set_environment(fe_env_cb);
+    c->set_video_refresh(fe_video_cb);
+    c->set_audio_sample(fe_audio_cb);
+    c->set_audio_sample_batch(fe_audio_batch_cb);
+    c->set_input_poll(fe_input_poll_cb);
+    c->set_input_state(fe_input_state_cb);
+    c->init();
+
+    struct retro_game_info gi;
+    memset(&gi, 0, sizeof(gi));
+    if (idx == 0) {
+        /* Fix sprite pointer in ROM copy (0x238) */
+        static uint8_t rom_fixed[sizeof(ROM_C8_BOUNCE)];
+        memcpy(rom_fixed, ROM_C8_BOUNCE, sizeof(ROM_C8_BOUNCE));
+        rom_fixed[0x0A] = 0xA2;
+        rom_fixed[0x0B] = 0x38;
+        gi.path = "builtin://bounce.ch8";
+        gi.data = rom_fixed;
+        gi.size = sizeof(rom_fixed);
+        snprintf(g_rom_name, sizeof(g_rom_name), "Built-in Bounce.ch8");
+    } else {
+        build_gb_demo_rom();
+        gi.path = "builtin://dmg_test.gb";
+        gi.data = g_gb_demo_rom;
+        gi.size = sizeof(g_gb_demo_rom);
+        snprintf(g_rom_name, sizeof(g_rom_name), "Built-in DMG Test.gb");
+    }
+
+    g_rom_loaded = c->load_game(&gi) ? 1 : 0;
+    g_frames = 0;
+    if (g_rom_loaded) {
+        c->run();
+        g_frames++;
+        struct retro_system_info si;
+        c->get_system_info(&si);
+        snprintf(g_status, sizeof(g_status), "Loaded %s v%s (ABI v%u)",
+                 si.library_name, si.library_version, c->api_version());
+    } else {
+        snprintf(g_status, sizeof(g_status), "Error: Failed to load ROM");
+    }
+}
+
+static void pdose_load_external_rom(void)
+{
+    const pdose_core_t *c = &g_cores[g_core_idx];
+    FILE *fp = fopen(c->default_rom_path, "rb");
+    if (!fp) {
+        snprintf(g_status, sizeof(g_status), "No ROM at %s", c->default_rom_path);
+        return;
+    }
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (sz <= 0 || sz > 2 * 1024 * 1024) {
+        fclose(fp);
+        snprintf(g_status, sizeof(g_status), "Invalid ROM size (%ld bytes)", sz);
+        return;
+    }
+    uint8_t *buf = (uint8_t *)malloc((size_t)sz);
+    if (!buf) {
+        fclose(fp);
+        snprintf(g_status, sizeof(g_status), "Out of memory loading ROM");
+        return;
+    }
+    size_t rd = fread(buf, 1, (size_t)sz, fp);
+    fclose(fp);
+
+    struct retro_game_info gi;
+    memset(&gi, 0, sizeof(gi));
+    gi.path = c->default_rom_path;
+    gi.data = buf;
+    gi.size = rd;
+
+    if (c->load_game(&gi)) {
+        g_rom_loaded = 1;
+        g_frames = 0;
+        snprintf(g_rom_name, sizeof(g_rom_name), "%s", c->default_rom_path);
+        c->run();
+        g_frames++;
+        snprintf(g_status, sizeof(g_status), "Loaded external ROM (%u bytes)", (unsigned)rd);
+    } else {
+        snprintf(g_status, sizeof(g_status), "Core rejected ROM file");
+    }
+    free(buf);
+}
+
+static void pdose_step_frames(int n)
+{
+    if (!g_rom_loaded) return;
+    const pdose_core_t *c = &g_cores[g_core_idx];
+    for (int i = 0; i < n; i++) {
+        c->run();
+        g_frames++;
+    }
+}
+
+/* ============================================================================
+ * GUI Rendering & Input Handlers (<app.h>)
+ * ============================================================================ */
+
+static void draw_btn(app_window_t *win, int x, int y, int w, int h,
+                     const char *lbl, uint32_t bg, uint32_t border)
+{
+    app_fill_rect(win, x, y, w, h, bg);
+    app_draw_rect(win, x, y, w, h, border);
+    app_draw_text_center(win, x + w / 2, y + (h - 14) / 2, lbl, APP_WHITE);
+}
+
+static int hit(int mx, int my, int x, int y, int w, int h)
+{
+    return (mx >= x && mx < x + w && my >= y && my < y + h);
+}
+
+static void on_click(app_window_t *win, int mx, int my)
+{
+    (void)win;
+    /* Sidebar buttons */
+    if (hit(mx, my, SIDE_X, 62, SIDE_W, 26)) { pdose_select_core(0); return; }
+    if (hit(mx, my, SIDE_X, 94, SIDE_W, 26)) { pdose_select_core(1); return; }
+    if (hit(mx, my, SIDE_X, 134, SIDE_W, 26)) { pdose_load_external_rom(); return; }
+    if (hit(mx, my, SIDE_X, 174, SIDE_W, 26)) {
+        g_running = !g_running;
+        snprintf(g_status, sizeof(g_status), g_running ? "Emulation Running" : "Emulation Paused");
+        return;
+    }
+    if (hit(mx, my, SIDE_X, 206, SIDE_W, 26)) {
+        pdose_step_frames(4);
+        snprintf(g_status, sizeof(g_status), "Stepped to frame %u", (unsigned)g_frames);
+        return;
+    }
+    if (hit(mx, my, SIDE_X, 238, SIDE_W, 26)) {
+        if (g_rom_loaded) {
+            g_cores[g_core_idx].reset();
+            g_frames = 0;
+            pdose_step_frames(1);
+            snprintf(g_status, sizeof(g_status), "Core reset");
+        }
+        return;
+    }
+    if (hit(mx, my, SIDE_X, 278, 66, 26)) {
+        /* Save State */
+        const pdose_core_t *c = &g_cores[g_core_idx];
+        size_t sz = c->serialize_size();
+        if (sz > 0) {
+            if (g_savestate) free(g_savestate);
+            g_savestate = malloc(sz);
+            if (g_savestate && c->serialize(g_savestate, sz)) {
+                g_savestate_sz = sz;
+                snprintf(g_status, sizeof(g_status), "State saved (%u B)", (unsigned)sz);
+            }
+        }
+        return;
+    }
+    if (hit(mx, my, SIDE_X + 74, 278, 66, 26)) {
+        /* Load State */
+        const pdose_core_t *c = &g_cores[g_core_idx];
+        if (g_savestate && c->unserialize(g_savestate, g_savestate_sz)) {
+            pdose_step_frames(1);
+            snprintf(g_status, sizeof(g_status), "State restored");
+        } else {
+            snprintf(g_status, sizeof(g_status), "No save state available");
+        }
+        return;
+    }
+
+    /* On-screen RetroPad buttons (bottom bar y=312..386) */
+    uint16_t pulse = 0;
+    if (hit(mx, my,  52, 314, 34, 24)) pulse = (1u << RETRO_DEVICE_ID_JOYPAD_UP);
+    if (hit(mx, my,  52, 362, 34, 24)) pulse = (1u << RETRO_DEVICE_ID_JOYPAD_DOWN);
+    if (hit(mx, my,  16, 338, 34, 24)) pulse = (1u << RETRO_DEVICE_ID_JOYPAD_LEFT);
+    if (hit(mx, my,  88, 338, 34, 24)) pulse = (1u << RETRO_DEVICE_ID_JOYPAD_RIGHT);
+    if (hit(mx, my, 152, 346, 62, 24)) pulse = (1u << RETRO_DEVICE_ID_JOYPAD_SELECT);
+    if (hit(mx, my, 222, 346, 62, 24)) pulse = (1u << RETRO_DEVICE_ID_JOYPAD_START);
+    if (hit(mx, my, 304, 346, 40, 28)) pulse = (1u << RETRO_DEVICE_ID_JOYPAD_B);
+    if (hit(mx, my, 352, 334, 40, 28)) pulse = (1u << RETRO_DEVICE_ID_JOYPAD_A);
+
+    if (pulse) {
+        g_pad_mask = pulse;
+        pdose_step_frames(4);
+        g_pad_mask = 0;
+    }
+}
+
+static void on_draw(app_window_t *win)
+{
+    if (g_running && g_rom_loaded) {
+        pdose_step_frames(1);
+    }
+
+    /* Window Background */
+    app_fill_rect(win, 0, 0, WIN_W, WIN_H, APP_RGB(18, 20, 28));
+
+    /* Header Bar */
+    app_fill_rect(win, 0, 0, WIN_W, 32, APP_RGB(28, 38, 58));
+    app_draw_string(win, 12, 8, "PDOSE — Libretro Emulator", APP_WHITE);
+    char hdr[48];
+    snprintf(hdr, sizeof(hdr), "Frame: %u | %s", (unsigned)g_frames,
+             g_running ? "RUN" : "PAUSE");
+    app_draw_text_right(win, WIN_W - 12, 8, hdr, APP_RGB(120, 220, 255));
+
+    /* Emulation Viewport Bezel */
+    app_fill_rect(win, VIEW_X - 2, VIEW_Y - 2, VIEW_W + 4, VIEW_H + 4, APP_RGB(8, 10, 14));
+    app_draw_rect(win, VIEW_X - 2, VIEW_Y - 2, VIEW_W + 4, VIEW_H + 4, APP_RGB(65, 85, 120));
+
+    /* Blit Libretro Framebuffer scaled to viewport */
+    if (g_fb_w > 0 && g_fb_h > 0) {
+        int scale = (int)(VIEW_W / g_fb_w);
+        int sy_sc = (int)(VIEW_H / g_fb_h);
+        if (sy_sc < scale) scale = sy_sc;
+        if (scale < 1) scale = 1;
+        int dw = (int)g_fb_w * scale;
+        int dh = (int)g_fb_h * scale;
+        int ox = VIEW_X + (VIEW_W - dw) / 2;
+        int oy = VIEW_Y + (VIEW_H - dh) / 2;
+
+        for (unsigned y = 0; y < g_fb_h; y++) {
+            for (unsigned x = 0; x < g_fb_w; x++) {
+                uint32_t col = g_fb[y * g_fb_w + x];
+                app_fill_rect(win, ox + (int)x * scale, oy + (int)y * scale,
+                              scale, scale, col);
+            }
+        }
+    } else {
+        app_draw_text_center(win, VIEW_X + VIEW_W / 2, VIEW_Y + VIEW_H / 2 - 8,
+                             "No Video Signal", APP_MID_GREY);
+    }
+
+    /* Right Sidebar: Core & Playback Controls */
+    app_draw_string(win, SIDE_X, 42, "LIBRETRO CORES", APP_RGB(150, 175, 210));
+    draw_btn(win, SIDE_X, 62, SIDE_W, 26, "CHIP-8",
+             g_core_idx == 0 ? APP_BTN_OP : APP_BTN,
+             g_core_idx == 0 ? APP_WHITE  : APP_MID_GREY);
+    draw_btn(win, SIDE_X, 94, SIDE_W, 26, "Game Boy (DMG)",
+             g_core_idx == 1 ? APP_BTN_OP : APP_BTN,
+             g_core_idx == 1 ? APP_WHITE  : APP_MID_GREY);
+
+    draw_btn(win, SIDE_X, 134, SIDE_W, 26, "Load SD ROM",
+             APP_RGB(48, 82, 62), APP_RGB(95, 165, 120));
+
+    draw_btn(win, SIDE_X, 174, SIDE_W, 26, g_running ? "Pause" : "Resume",
+             APP_BTN, APP_MID_GREY);
+    draw_btn(win, SIDE_X, 206, SIDE_W, 26, "Step +4F",
+             APP_BTN, APP_MID_GREY);
+    draw_btn(win, SIDE_X, 238, SIDE_W, 26, "Reset Core",
+             APP_RGB(95, 45, 45), APP_RGB(170, 90, 90));
+
+    draw_btn(win, SIDE_X,      278, 66, 26, "Save", APP_BTN, APP_MID_GREY);
+    draw_btn(win, SIDE_X + 74, 278, 66, 26, "Load", APP_BTN, APP_MID_GREY);
+
+    /* Bottom RetroPad Strip */
+    app_fill_rect(win, 10, 308, WIN_W - 20, 84, APP_RGB(24, 27, 36));
+    app_draw_rect(win, 10, 308, WIN_W - 20, 84, APP_RGB(55, 65, 85));
+
+    draw_btn(win,  52, 314, 34, 24, "U", APP_BTN, APP_MID_GREY);
+    draw_btn(win,  52, 362, 34, 24, "D", APP_BTN, APP_MID_GREY);
+    draw_btn(win,  16, 338, 34, 24, "L", APP_BTN, APP_MID_GREY);
+    draw_btn(win,  88, 338, 34, 24, "R", APP_BTN, APP_MID_GREY);
+    draw_btn(win, 152, 346, 62, 24, "SEL", APP_BTN, APP_MID_GREY);
+    draw_btn(win, 222, 346, 62, 24, "STA", APP_BTN, APP_MID_GREY);
+    draw_btn(win, 304, 346, 40, 28, "B", APP_RGB(140, 42, 62), APP_WHITE);
+    draw_btn(win, 352, 334, 40, 28, "A", APP_RGB(160, 48, 72), APP_WHITE);
+
+    app_draw_string(win, 408, 322, "ROM:", APP_RGB(140, 150, 175));
+    app_draw_string(win, 408, 340, g_rom_name, APP_RGB(235, 220, 120));
+    char res[32];
+    snprintf(res, sizeof(res), "%ux%u XRGB", g_fb_w, g_fb_h);
+    app_draw_string(win, 408, 362, res, APP_RGB(140, 200, 255));
+
+    /* Status Bar */
+    app_fill_rect(win, 0, WIN_H - 22, WIN_W, 22, APP_RGB(14, 16, 22));
+    app_draw_string(win, 10, WIN_H - 18, g_status, APP_RGB(185, 200, 220));
+}
+
+void app_main(void)
+{
+    pdose_select_core(0);
+    app_window_t *win = app_create("PDOSE", WIN_W, WIN_H);
+    if (!win) return;
+    app_set_draw (win, on_draw);
+    app_set_click(win, on_click);
+    app_run(win);
+}
