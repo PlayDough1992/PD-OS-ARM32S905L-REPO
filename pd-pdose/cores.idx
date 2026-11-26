@@ -1,0 +1,18 @@
+# PDOSE Libretro Core Index for PD-OS ARM32 (Amlogic S905L)
+# Format: core_id|Display Name|rom_subfolder (/home/pd/roms/<system>)
+gambatte_libretro|Gambatte (GB / GBC)|gb
+sameboy_libretro|SameBoy (GB / GBC)|gbc
+mgba_libretro|mGBA (Game Boy Advance)|gba
+gpsp_libretro|gpSP (Game Boy Advance)|gba
+fceumm_libretro|FCEUmm (NES / Famicom)|nes
+nestopia_libretro|Nestopia (NES / Famicom)|nes
+snes9x2010_libretro|Snes9x 2010 (SNES)|snes
+snes9x_libretro|Snes9x (SNES)|snes
+genesis_plus_gx_libretro|Genesis Plus GX (MD / SMS)|md
+picodrive_libretro|PicoDrive (MD / 32X)|md
+pcsx_rearmed_libretro|PCSX ReARMed (PS1)|psx
+mednafen_pce_fast_libretro|Beetle PCE Fast (TG16)|pce
+stella2014_libretro|Stella 2014 (Atari 2600)|atari2600
+prosystem_libretro|ProSystem (Atari 7800)|atari7800
+mame2003_plus_libretro|MAME 2003-Plus (Arcade)|arcade
+fbneo_libretro|FinalBurn Neo (Arcade)|arcade
